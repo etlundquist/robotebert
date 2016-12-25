@@ -2,6 +2,7 @@
 #--------------------------------
 
 auth/*
+src/old/*
 .idea/*
 
 # STANDARD PYTHON .GITIGNORE TEMPLATE

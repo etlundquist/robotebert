@@ -1,2 +1,2 @@
 # robotebert
-Movie reviews based on Twitter sentiment analysis
+Movie reviews based on Twitter sentiment analysis. 

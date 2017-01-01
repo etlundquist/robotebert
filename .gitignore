@@ -1,3 +1,13 @@
+# CUSTOM IGNORES FOR THIS PROJECT
+#--------------------------------
+
+auth/*
+src/old/*
+.idea/*
+
+# STANDARD PYTHON .GITIGNORE TEMPLATE
+#------------------------------------
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

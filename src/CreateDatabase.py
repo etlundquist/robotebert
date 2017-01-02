@@ -64,9 +64,22 @@ tweets = '''CREATE TABLE tweets (
               PRIMARY KEY (title, tweet_id)
             )'''
 
+labeled = '''CREATE TABLE labeled (
+               title      TEXT,
+               tweet_id   INTEGER,
+               tweet_text TEXT,
+               pr_neg     REAL,
+               pr_neu     REAL,
+               pr_pos     REAL,
+               label      INTEGER,
+               method     TEXT,
+               PRIMARY KEY (title, tweet_id)
+            )'''
+
 cur.execute(boxoffice)
 cur.execute(movies)
 cur.execute(tweets)
+cur.execute(labeled)
 
 # commit changes and close the connection
 #----------------------------------------

@@ -106,7 +106,8 @@ def getNewMovies(cnx, titles):
     """find the new box office titles not already in the movies table
     :param cnx: database connection
     :param titles: movie titles from the daily box office data
-    :return: set of new movie titles"""
+    :return: set of new movie titles
+    """
 
     cur = cnx.cursor()
     cur.execute("SELECT DISTINCT title FROM movies")
@@ -227,7 +228,8 @@ def getMovieInfo(endpoint, title, year):
     :param endpoint: API endpoint to sent requests
     :param title: movie title to search
     :param year: movie release year
-    :return: a dictionary of metadata results"""
+    :return: a dictionary of metadata results
+    """
 
     params   = {'t': title, 'y': year, 'plot':'short', 'r':'json', 'tomatoes':'true'}
     response = requests.get(endpoint, params=params)
@@ -267,7 +269,8 @@ def insertMovie(cnx, title, year, results):
     :param title: movie title
     :param year: movie release year
     :param results: getMovieInfo() results
-    :return: None"""
+    :return: None
+    """
 
     try:
         cur = cnx.cursor()

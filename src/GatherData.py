@@ -18,7 +18,7 @@ BO_ENDPOINT_2 = "http://www.boxofficemojo.com/daily/chart/?view=1day&sortdate={0
 OMDB_ENDPOINT = "http://www.omdbapi.com/"
 DB_FILE       = "data/database.db"
 ENGINE        = create_engine("sqlite:///{0}".format(DB_FILE))
-MAX_TWEETS    = 1000 # max number of tweets to gather for each movie title
+MAX_TWEETS    = 250  # max number of tweets to gather for each movie title
 CNT_MOVIES    = 10   # number of movies (by descending revenue) to take from daily box office
 
 # define some general utility functions
@@ -31,7 +31,7 @@ def processTitle(title):
     note: removes parenthetical year and after-colon text from the titles
     """
 
-    cleaned = title.lower()
+    cleaned = re.sub(r'[!@#$%?]+', '', title.lower().strip())
     cleaned = re.sub(r'\(\d{4}.*\)', '', cleaned)
     cleaned = re.sub(r':.+', '', cleaned).strip()
     return cleaned
@@ -56,6 +56,9 @@ def findLastDate(endpoint):
     except urlerr.URLError as err:
         print("\nThere was an error retrieving the daily BOMojo chart")
         print(err)
+        return None
+    except Exception:
+        print("\nThere's something wrong with the BOMojo Chart")
         return None
 
 
@@ -99,6 +102,9 @@ def getTopMovies(endpoint, date, count=10):
     except urlerr.URLError as err:
         print("\nThere was an error retrieving daily revenue information")
         print(err)
+        return None
+    except Exception:
+        print("\nThere's something wrong with the BOMojo daily revenue page")
         return None
 
 
@@ -146,7 +152,7 @@ def processTweet(title, tweet, remove_title=False):
 
     # create a title regex and initialize a dictionary to hold results
 
-    texp    = r"#?" + r" ?".join(title.split(" "))
+    texp    = r"#?" + r" ?".join(processTitle(title).split(" "))
     results = {}
 
     # retrieve author metadata
@@ -174,9 +180,9 @@ def processTweet(title, tweet, remove_title=False):
 
     # retrieve raw tweet text and clean it up
 
-    text = tweet.text.replace('\n', '').replace("'", "").replace('"', '').lower()
-    text = re.sub(r'(rt )?@\w+:?', '', text)
-    text = re.sub(texp, '', text) if remove_title else text
+    text = tweet.text.replace('\n', '').replace("'", "").replace('"', '')
+    text = re.sub(r'(RT )?@\w+:?', '', text)
+    text = re.sub(texp, '', text, flags=re.IGNORECASE) if remove_title else text
     text = re.sub(r'\&\w+;', '', text)
     text = re.sub(r' {2,}', ' ', text).strip()
 
@@ -200,7 +206,7 @@ def searchMovie(api, title, date, count, retweets=False):
     until = datetime.strptime(since, '%Y-%m-%d') + timedelta(days=1)
     until = until.strftime('%Y-%m-%d')
 
-    query = "\"{0}\" since:{1} until:{2} -filter:links".format(title, since, until)
+    query = "\"{0}\" since:{1} until:{2} -filter:links".format(processTitle(title), since, until)
     if retweets == False:
         query += " -filter:retweets"
 
@@ -209,7 +215,7 @@ def searchMovie(api, title, date, count, retweets=False):
 
     for i, tweet in enumerate(rawtweets):
         try:
-            results.append(processTweet(title, tweet))
+            results.append(processTweet(title, tweet, remove_title=True))
         except tweepy.error.TweepError as err:
             print("\nThere was an error processing tweet #{0} for title [{1}]".format(i, title))
             print(err.messages[0]['code'])
@@ -329,7 +335,7 @@ def gatherData():
     # get tweet data
 
     for movie in bodata.title:
-        tweets = searchMovie(api, processTitle(movie), curdate, MAX_TWEETS)
+        tweets = searchMovie(api, movie, curdate, MAX_TWEETS)
         if not tweets.empty:
             tweets.to_sql('tweets', ENGINE, if_exists='append', index=False)
             print("Tweets for [{0}] Written to Database".format(movie))
@@ -344,33 +350,40 @@ def gatherData():
 
     for movie in newmovies:
         minfo = getMovieInfo(OMDB_ENDPOINT, processTitle(movie), year)
-        insertMovie(cnx, movie, year, minfo)
+        if minfo:
+            insertMovie(cnx, movie, year, minfo)
+        else:
+            print("Movie: [{0}] Not Found via OMDB".format(movie))
 
     # commit changes and close DB connection
 
     cnx.commit()
     cnx.close()
 
-def outputData():
-    """output the three main data tables to CSV for visual inspection"""
+def outputData(tname):
+    """output a data table to CSV for visual inspection
+    :param tname: string name of the table to output
+    """
 
-    movies    = pd.read_sql("SELECT * FROM movies",    ENGINE)
-    boxoffice = pd.read_sql("SELECT * FROM boxoffice", ENGINE)
-    tweets    = pd.read_sql("SELECT * FROM tweets",    ENGINE)
-
-    movies.to_csv('data/movies.csv',       sep=",", header=True, index=False, quoting=csv.QUOTE_NONNUMERIC)
-    boxoffice.to_csv('data/boxoffice.csv', sep=",", header=True, index=False, quoting=csv.QUOTE_NONNUMERIC)
-    tweets.to_csv('data/tweets.csv',       sep=",", header=True, index=False, quoting=csv.QUOTE_NONNUMERIC)
-
+    table = pd.read_sql("SELECT * FROM {0}".format(tname), ENGINE)
+    table.to_csv("data/{0}.csv".format(tname), sep=",", header=True, index=False, quoting=csv.QUOTE_NONNUMERIC)
 
 # execute the main data gathering and output functions
 #-----------------------------------------------------
 
 if __name__ == "__main__":
     gatherData()
-    outputData()
+
+# output data tables to CSV
+#--------------------------
+
+outputData("movies")
+outputData("boxoffice")
+outputData("tweets")
+outputData("labeled")
 
 # check resource usage status and rate limit period
+#--------------------------------------------------
 
 # api = generateAPI(wait_on_rate_limit=True, wait_on_rate_limit_notify=True, **CREDENTIALS)
 # api.rate_limit_status()['resources']['search']['/search/tweets']

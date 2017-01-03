@@ -2,10 +2,9 @@
 #--------------------------------
 
 auth/*
+data/*
 src/old/*
 .idea/*
-vader-movies-data.tsv
-vader-tweets-data.tsv
 
 # STANDARD PYTHON .GITIGNORE TEMPLATE
 #------------------------------------

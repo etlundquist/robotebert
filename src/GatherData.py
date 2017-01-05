@@ -18,8 +18,8 @@ BO_ENDPOINT_2 = "http://www.boxofficemojo.com/daily/chart/?view=1day&sortdate={0
 OMDB_ENDPOINT = "http://www.omdbapi.com/"
 DB_FILE       = "data/database.db"
 ENGINE        = create_engine("sqlite:///{0}".format(DB_FILE))
-MAX_TWEETS    = 250  # max number of tweets to gather for each movie title
-CNT_MOVIES    = 10   # number of movies (by descending revenue) to take from daily box office
+MAX_TWEETS    = 200  # max number of tweets to gather for each movie title
+CNT_MOVIES    = 12   # number of movies (by descending revenue) to take from daily box office
 
 # define some general utility functions
 #--------------------------------------
@@ -183,7 +183,6 @@ def processTweet(title, tweet, remove_title=False):
     text = tweet.text.replace('\n', '').replace("'", "").replace('"', '')
     text = re.sub(r'(RT )?@\w+:?', '', text)
     text = re.sub(texp, '', text, flags=re.IGNORECASE) if remove_title else text
-    text = re.sub(r'\&\w+;', '', text)
     text = re.sub(r' {2,}', ' ', text).strip()
 
     results['tweet_text'] = text
@@ -360,6 +359,7 @@ def gatherData():
     cnx.commit()
     cnx.close()
 
+
 def outputData(tname):
     """output a data table to CSV for visual inspection
     :param tname: string name of the table to output
@@ -377,10 +377,10 @@ if __name__ == "__main__":
 # output data tables to CSV
 #--------------------------
 
-outputData("movies")
-outputData("boxoffice")
-outputData("tweets")
-outputData("labeled")
+# outputData("movies")
+# outputData("boxoffice")
+# outputData("tweets")
+# outputData("labeled")
 
 # check resource usage status and rate limit period
 #--------------------------------------------------
@@ -388,5 +388,3 @@ outputData("labeled")
 # api = generateAPI(wait_on_rate_limit=True, wait_on_rate_limit_notify=True, **CREDENTIALS)
 # api.rate_limit_status()['resources']['search']['/search/tweets']
 # datetime.fromtimestamp(api.rate_limit_status()['resources']['search']['/search/tweets']['reset'])
-
-

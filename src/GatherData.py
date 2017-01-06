@@ -5,9 +5,11 @@ import re, csv, json, sqlite3, requests, tweepy
 import pandas as pd
 import urllib.request as urlreq
 import urllib.error as urlerr
+
 from sqlalchemy import create_engine
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
+from src.CustomExceptions import *
 
 # define constants to be used later
 #----------------------------------
@@ -257,7 +259,7 @@ def getMovieInfo(endpoint, title, year):
     except requests.exceptions.Timeout:
         print("The HTTP request timed out")
     except LookupError:
-        print("Movie [{0}] - [{1}] not found via OMDB".format(title, year))
+        print("Could not find the movie/year combination: {0} - {1}".format(title, year))
     return None
 
 
@@ -311,8 +313,7 @@ def gatherData():
         bodata.to_sql('boxoffice', ENGINE, if_exists='append', index=False)
         print("Box Office Data for [{0}] Written to Database".format(nextdate))
     else:
-        print("Error Scraping/Writing Box Office Data for [{0}]".format(nextdate))
-        raise Exception
+        raise BOError("Error Scraping/Writing Box Office Data for [{0}]".format(nextdate))
 
     # attempt to collect tweet data
 
@@ -322,8 +323,7 @@ def gatherData():
             tweets.to_sql('tweets', ENGINE, if_exists='append', index=False)
             print("Tweets for [{0}] Written to Database".format(movie))
         else:
-            print("Error Fetching/Writing Tweets for [{0}]".format(movie))
-            raise Exception
+            raise TweetError("Error Fetching/Writing Tweets for [{0}]".format(movie))
 
     # attempt to collect movie metadata
 
@@ -340,22 +340,19 @@ def gatherData():
 
     # commit changes and close DB connection
 
+    print("\nAll Data for {0} Successfully Added to the Database!\n".format(nextdate))
     cnx.commit()
     cnx.close()
 
 
-# execute the main data gathering and output functions
-#-----------------------------------------------------
+# execute the main data gathering function and output updated tables to CSV
+#--------------------------------------------------------------------------
 
 if __name__ == "__main__":
+
     gatherData()
     outputData("boxoffice")
     outputData("tweets")
     outputData("movies")
 
-# check resource usage status and rate limit period
-#--------------------------------------------------
 
-# api = generateAPI(wait_on_rate_limit=True, wait_on_rate_limit_notify=True, **CREDENTIALS)
-# api.rate_limit_status()['resources']['search']['/search/tweets']
-# datetime.fromtimestamp(api.rate_limit_status()['resources']['search']['/search/tweets']['reset'])

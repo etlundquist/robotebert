@@ -6,14 +6,16 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine
 
+from nltk import pos_tag
+from nltk.stem import WordNetLemmatizer
 from nltk.tokenize.casual import TweetTokenizer
 from nltk.sentiment.util import mark_negation
-from nltk.corpus import stopwords
+from nltk.corpus import wordnet, stopwords
 
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import GridSearchCV
-from sklearn.feature_extraction.text import HashingVectorizer
-from sklearn.linear_model import SGDClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
 
 # define constants to be used later
 #----------------------------------
@@ -21,8 +23,8 @@ from sklearn.linear_model import SGDClassifier
 DB_FILE   = "data/database.db"
 ENGINE    = create_engine("sqlite:///{0}".format(DB_FILE))
 RAWDATA   = 'data/vader-tweets-data.tsv'
-DATE      = '2017-01-02'
-THRESHOLD = 0.85
+DATE      = '2017-01-03'
+THRESHOLD = 0.90
 
 # define functions to save and load the raw training data from disk
 #------------------------------------------------------------------
@@ -57,19 +59,50 @@ def saveRawData(engine, X, y):
 # define tweet pre-processing/utility functions
 #----------------------------------------------
 
+def mapWordNet(tag):
+    """utility function to map Penn TreeBank POS tags into WordNet POS tags
+    :param tag: Penn TreeBank POS tag
+    :return: WordNet POS tag
+    """
+
+    if tag.startswith('J'):
+        return wordnet.ADJ
+    elif tag.startswith('V'):
+        return wordnet.VERB
+    elif tag.startswith('R'):
+        return wordnet.ADV
+    else:
+        return wordnet.NOUN
+
+
+def lemmatizeTokens(tokens):
+    """
+    lemmatize raw tweet tokens using the inferred POS
+    :param tokens: tweet text as a list of tokens
+    :return: lemmatized list of tokens
+    """
+
+    lemmatizer = WordNetLemmatizer()
+    tb_tokens  = pos_tag(tokens)
+    wn_tokens  = [(token[0], mapWordNet(token[1])) for token in tb_tokens]
+    lemmatized = [lemmatizer.lemmatize(token[0], token[1]) for token in wn_tokens]
+    return lemmatized
+
+
 def tokenizeTweet(tweet):
     """tokenize a tweet according to several sequential steps
     :param tweet: tweet text as a string
     :return: tokenized tweet as a list
     1. basic steps taken by TweetTokenizer()
-    2. mark negated words with [X_NEG]
-    3. filter out punctuation, numbers, and one/two letter words
-    4. remove common english stopwords
+    2. lemmatize all tokens by POS
+    3. mark negated words with [X_NEG]
+    4. filter out punctuation, numbers, and one/two letter words
+    5. remove common english stopwords
     """
 
-    # initialize the baseline TweetTokenizer() and tokenize the tweet into a list of tokens
+    # initialize the baseline TweetTokenizer(), tokenize, and lemmatize the tweet
     tokenizer = TweetTokenizer(preserve_case=False, reduce_len=True, strip_handles=True)
-    tokens    = tokenizer.tokenize(tweet)
+    tokens    = lemmatizeTokens(tokenizer.tokenize(tweet))
 
     # mark negation for words between a negative and a punctuation character, and undo emoticon negation
     tokens = mark_negation(tokens)
@@ -94,18 +127,18 @@ def tokenizeTweet(tweet):
 #--------------------------------
 
 def cvTrain(X, y):
-    """cross-validate and fit a SGDClassifier() on an initial training data set
+    """cross-validate and fit a TFIDFVectorizer() & LogisticRegression() on an initial training set
     :param X: raw tweet text vector (will be transformed prior to fitting)
     :param y: sentiment label vector
-    :return: tuned and fit [vectorizer] and [classifier] objects to use going forward
+    :return: tuned and fit [estimator] object
     """
 
     # set up the text vectorizer, classifier, pipeline, and tuning parameters
-    vectorizer = HashingVectorizer(tokenizer=tokenizeTweet, non_negative=True, n_features=2**16)
-    classifier = SGDClassifier(loss='log', penalty='l2', shuffle=True, n_iter=10, n_jobs=4)
+    vectorizer = TfidfVectorizer(tokenizer=tokenizeTweet, norm='l2', use_idf=False)
+    classifier = LogisticRegression(penalty='l2', multi_class='multinomial', solver='sag', max_iter=250)
     pipeline   = Pipeline([('vct', vectorizer), ('clf', classifier)])
-    parameters = dict(vct__ngram_range=[(1,1), (1,2)], vct__norm=[None, 'l1', 'l2'],
-                      vct__binary=[True, False], clf__alpha=[1e-5, 1e-4, 1e-3])
+    parameters = dict(vct__ngram_range=[(1,1), (1,2)], vct__max_features=[5000, 10000, 20000],
+                      vct__binary=[True, False], clf__C=[1e-1, 1, 10, 100])
 
     # use cross-validation to select tuning parameters
     print("Tuning the Model on Initial Data via Cross Validation")
@@ -118,18 +151,16 @@ def cvTrain(X, y):
     for k, v in cv.best_params_.items():
         print("{0} = {1}".format(k, v))
 
-    vectorizer = cv.best_estimator_.get_params()['vct']
-    classifier = cv.best_estimator_.get_params()['clf']
-    return vectorizer, classifier
+    print("Returning Trained Estimator")
+    return cv.best_estimator_
 
 
-def reTrain(engine, vectorizer, classifier, epochs=20):
-    """fully re-train the classifier using both the original training and newly labeled data
+def reTrain(engine, estimator, epochs=20):
+    """fully re-train the estimator using both the original training and newly labeled data
     :param engine: sqlalchemy engine for database connection
-    :param vectorizer: sklearn text vectorizer used for feature creation
-    :param classifier: sklearn classifier used for classification/prediction
+    :param estimator: sklearn pipeline estimator
     :param epochs: number of training epochs (full passes through the training data)
-    :return: the original [vectorizer] and updated [classifier]
+    :return: the re-fit [estimator] object
     """
 
     o_data = pd.read_sql('SELECT tweet_text, label FROM training', engine)
@@ -138,26 +169,11 @@ def reTrain(engine, vectorizer, classifier, epochs=20):
     n_data = pd.read_sql('SELECT tweet_text, label FROM labeled', engine)
     n_X, n_y = n_data.tweet_text, n_data.label
 
-    X = vectorizer.transform(np.array(o_X.append(n_X)))
+    X = np.array(o_X.append(n_X))
     y = np.array(o_y.append(n_y))
 
-    classifier.set_params(verbose=1, n_iter=epochs, warm_start=True)
-    return vectorizer, classifier.fit(X, y)
-
-
-def batchTrain(labeled, vectorizer, classifier):
-    """update the classifier using partial_fit() on a batch of newly labeled data
-    :param tweets: dataframe of newly labeled tweets [tweet_text, label]
-    :param vectorizer: sklearn text vectorizer used for feature creation
-    :param classifier: sklearn classifier used for classification/prediction
-    :return: the original [vectorizer] and updated [classifier]
-    """
-
-    X, y = vectorizer.transform(labeled.tweet_text), labeled.label
-    classes = np.unique(y)
-
-    classifier.set_params(verbose=1, warm_start=True)
-    return vectorizer, classifier.partial_fit(X, y, classes)
+    estimator.set_params(clf__verbose=1)
+    return estimator.fit(X, y)
 
 
 # define functions to pull unlabeled tweets from the database and label them
@@ -190,18 +206,17 @@ def pullTweets(engine, date, count=25):
         return None
     
 
-def labelSelfTrain(engine, vectorizer, classifier, tweets, threshold):
+def labelSelfTrain(engine, estimator, tweets, threshold):
     """label a data set of new tweets via self-training and save them to the database
     :param engine: sqlalchemy engine for database connection
-    :param vectorizer: sklearn text vectorizer used for feature creation
-    :param classifier: sklearn classifier used for classification/prediction
+    :param estimator: sklearn pipeline estimator
     :param tweets: a dataframe of tweets to be labeled [title, tweet_id, tweet_text]
     :param threshold: predicted probability threshold to be used for self-training
     :return: a dataframe of newly labeled tweets or None on failure
     note: tweets with max class probabilities above the threshold will be auto-labeled
     """
     
-    classprobs = classifier.predict_proba(vectorizer.transform(tweets.tweet_text))
+    classprobs = estimator.predict_proba(tweets.tweet_text)
     labeled = tweets.copy()
     
     labeled['pr_neg'] = classprobs[:, 0]
@@ -225,18 +240,17 @@ def labelSelfTrain(engine, vectorizer, classifier, tweets, threshold):
         return None
 
 
-def labelManual(engine, vectorizer, classifier, tweets, threshold):
+def labelManual(engine, estimator, tweets, threshold):
     """label a data set of new tweets via manual annotation and save them to the database
     :param engine: sqlalchemy engine for database connection
-    :param vectorizer: sklearn text vectorizer used for feature creation
-    :param classifier: sklearn classifier used for classification/prediction
+    :param estimator: sklearn pipeline estimator
     :param tweets: a dataframe of tweets to be labeled [title, tweet_id, tweet_text]
     :param threshold: predicted probability threshold to be used for manual annotation
     :return: a dataframe of the newly labeled tweets or None on failure
     note: only tweets with max class probabilities below the threshold will be manually labeled
     """
 
-    classprobs = classifier.predict_proba(vectorizer.transform(tweets.tweet_text))
+    classprobs = estimator.predict_proba(tweets.tweet_text)
     labeled = tweets.copy()
 
     labeled['pr_neg'] = classprobs[:, 0]
@@ -291,48 +305,59 @@ def labelManual(engine, vectorizer, classifier, tweets, threshold):
 # run some unit tests with the functions defined above
 #-----------------------------------------------------
 
-# load in the raw training data and separate into [init, batch, test] data
+if __name__ == "__main__":
 
-X, y = loadRawData(RAWDATA, 'text', 'sentiment', sep='\t')
-accuracies = []
+    # STEPS TO DO LATER
+    # 1. CV train the model on the VADER tweets data
+    # 2. Manually label a lot of downloaded tweets (100 per film, a few distinct days)
+    # 3. replace the original training data with this new domain-specific training set
+    # 4. CV re-train the model with the new labeled data set
+    # 5. truncate the labeled table (it will be filled with interative labels)
+    # 6. pickle the model to avoid having to fully retrain
+    # 7. write a driver program to look for new data and re-train the model
 
-X_init,    y_init    = X[:1500],     y[:1500]
-X_batch_1, y_batch_1 = X[1500:2000], y[1500:2000]
-X_batch_2, y_batch_2 = X[2000:2500], y[2000:2500]
-X_batch_3, y_batch_3 = X[2500:3000], y[2500:3000]
-X_test,    y_test    = X[3000:],     y[3000:]
+    # load in the raw training data and separate into [init, batch, test] data
 
-saveRawData(ENGINE, X_init, y_init)
-cnx = sqlite3.connect('data/database.db')
-cur = cnx.cursor()
-cur.execute('DELETE FROM labeled')
-cnx.commit()
-cnx.close()
+    X, y = loadRawData(RAWDATA, 'text', 'sentiment', sep='\t')
+    accuracies = []
 
-batch_1 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_1)) + 1000,   'tweet_text': X_batch_1})
-batch_2 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_2)) + 10000,  'tweet_text': X_batch_2})
-batch_3 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_3)) + 100000, 'tweet_text': X_batch_3})
+    X_init,    y_init    = X[:1500],     y[:1500]
+    X_batch_1, y_batch_1 = X[1500:2000], y[1500:2000]
+    X_batch_2, y_batch_2 = X[2000:2500], y[2000:2500]
+    X_batch_3, y_batch_3 = X[2500:3000], y[2500:3000]
+    X_test,    y_test    = X[3000:],     y[3000:]
 
-# iteratively re-train and assess test set accuracy
+    saveRawData(ENGINE, X_init, y_init)
+    cnx = sqlite3.connect('data/database.db')
+    cur = cnx.cursor()
+    cur.execute('DELETE FROM labeled')
+    cnx.commit()
+    cnx.close()
 
-# initial training/scoring
-vectorizer, classifier = cvTrain(X_init, y_init)
-accuracies.append(classifier.score(vectorizer.transform(X_test), y_test))
+    batch_1 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_1)) + 1000,   'tweet_text': X_batch_1})
+    batch_2 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_2)) + 10000,  'tweet_text': X_batch_2})
+    batch_3 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_3)) + 100000, 'tweet_text': X_batch_3})
 
-# re-fit after handling batch #1
-labelSelfTrain(ENGINE, vectorizer, classifier, batch_1, THRESHOLD)
-# labelManual(ENGINE, vectorizer, classifier, batch_1, THRESHOLD)
-vectorizer, classifier = reTrain(ENGINE, vectorizer, classifier)
-accuracies.append(classifier.score(vectorizer.transform(X_test), y_test))
+    # iteratively re-train and assess test set accuracy
 
-# re-fit after handling batch #2
-labelSelfTrain(ENGINE, vectorizer, classifier, batch_2, THRESHOLD)
-# labelManual(ENGINE, vectorizer, classifier, batch_2, THRESHOLD)
-vectorizer, classifier = reTrain(ENGINE, vectorizer, classifier)
-accuracies.append(classifier.score(vectorizer.transform(X_test), y_test))
+    # initial training/scoring
+    estimator = cvTrain(X_init, y_init)
+    accuracies.append(estimator.score(X_test, y_test))
 
-# re-fit after handling batch #3
-labelSelfTrain(ENGINE, vectorizer, classifier, batch_3, THRESHOLD)
-# labelManual(ENGINE, vectorizer, classifier, batch_3, THRESHOLD)
-vectorizer, classifier = reTrain(ENGINE, vectorizer, classifier)
-accuracies.append(classifier.score(vectorizer.transform(X_test), y_test))
+    # re-fit after handling batch #1
+    labelSelfTrain(ENGINE, estimator, batch_1, THRESHOLD)
+    labelManual(ENGINE, estimator, batch_1, THRESHOLD)
+    estimator = reTrain(ENGINE, estimator)
+    accuracies.append(estimator.score(X_test, y_test))
+
+    # re-fit after handling batch #2
+    labelSelfTrain(ENGINE, estimator, batch_2, THRESHOLD)
+    labelManual(ENGINE, estimator, batch_2, THRESHOLD)
+    estimator = reTrain(ENGINE, estimator)
+    accuracies.append(estimator.score(X_test, y_test))
+
+    # re-fit after handling batch #3
+    labelSelfTrain(ENGINE, estimator, batch_3, THRESHOLD)
+    labelManual(ENGINE, estimator, batch_3, THRESHOLD)
+    estimator = reTrain(ENGINE, estimator)
+    accuracies.append(estimator.score(X_test, y_test))

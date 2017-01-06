@@ -2,7 +2,7 @@
 #------------------------
 
 import re, string, sqlite3
-import numpy  as np
+import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine
 
@@ -22,7 +22,7 @@ DB_FILE   = "data/database.db"
 ENGINE    = create_engine("sqlite:///{0}".format(DB_FILE))
 RAWDATA   = 'data/vader-tweets-data.tsv'
 DATE      = '2017-01-02'
-THRESHOLD = 0.90
+THRESHOLD = 0.85
 
 # define functions to save and load the raw training data from disk
 #------------------------------------------------------------------
@@ -42,7 +42,7 @@ def loadRawData(fpath, textcol, labelcol, **kwargs):
 
 
 def saveRawData(engine, X, y):
-    """save the initial training data to the database for use in retraining
+    """save the initial training data to the database for use in later retraining
     :param engine: sqlalchemy engine for database connection
     :param X: tweet text vector
     :param y: sentiment label vector
@@ -51,17 +51,18 @@ def saveRawData(engine, X, y):
 
     data = pd.DataFrame({'tweet_text': X, 'label': y})
     data.to_sql('training', engine, if_exists='replace', index=False)
+    return None
 
 
 # define tweet pre-processing/utility functions
 #----------------------------------------------
 
 def tokenizeTweet(tweet):
-    """tokenize a tweet according to several rules:
+    """tokenize a tweet according to several sequential steps
     :param tweet: tweet text as a string
     :return: tokenized tweet as a list
     1. basic steps taken by TweetTokenizer()
-    2. mark negated words
+    2. mark negated words with [X_NEG]
     3. filter out punctuation, numbers, and one/two letter words
     4. remove common english stopwords
     """
@@ -83,7 +84,7 @@ def tokenizeTweet(tweet):
 
     # remove common English stopwords (both negated and un-negated)
     swords = set(stopwords.words('english'))
-    tokens = [token for token in tokens if token not in swords and re.sub(r'_NEG', '', token) not in swords]
+    tokens = [token for token in tokens if token not in swords and re.sub(r'_NEG$', '', token) not in swords]
 
     # return the tokenized tweet as a list
     return tokens
@@ -92,11 +93,11 @@ def tokenizeTweet(tweet):
 # define model training functions
 #--------------------------------
 
-def initTrain(X, y):
-    """cross-validate and fit a SGDClassifier on an initial data set
+def cvTrain(X, y):
+    """cross-validate and fit a SGDClassifier() on an initial training data set
     :param X: raw tweet text vector (will be transformed prior to fitting)
     :param y: sentiment label vector
-    :return: tuned and fit vectorizer and classifier objects to use going forward
+    :return: tuned and fit [vectorizer] and [classifier] objects to use going forward
     """
 
     # set up the text vectorizer, classifier, pipeline, and tuning parameters
@@ -123,12 +124,12 @@ def initTrain(X, y):
 
 
 def reTrain(engine, vectorizer, classifier, epochs=20):
-    """fully re-train the classifier using both the original and new labeled data
+    """fully re-train the classifier using both the original training and newly labeled data
     :param engine: sqlalchemy engine for database connection
     :param vectorizer: sklearn text vectorizer used for feature creation
     :param classifier: sklearn classifier used for classification/prediction
-    :param epochs: number of training epochs (full passes through the data)
-    :return: updated vectorizer, classifier
+    :param epochs: number of training epochs (full passes through the training data)
+    :return: the original [vectorizer] and updated [classifier]
     """
 
     o_data = pd.read_sql('SELECT tweet_text, label FROM training', engine)
@@ -145,11 +146,11 @@ def reTrain(engine, vectorizer, classifier, epochs=20):
 
 
 def batchTrain(labeled, vectorizer, classifier):
-    """update the classifier using partial_fit() on a batch of new labeled data
+    """update the classifier using partial_fit() on a batch of newly labeled data
     :param tweets: dataframe of newly labeled tweets [tweet_text, label]
     :param vectorizer: sklearn text vectorizer used for feature creation
     :param classifier: sklearn classifier used for classification/prediction
-    :return: updated vectorizer, classifier
+    :return: the original [vectorizer] and updated [classifier]
     """
 
     X, y = vectorizer.transform(labeled.tweet_text), labeled.label
@@ -187,39 +188,72 @@ def pullTweets(engine, date, count=25):
         return tweets
     else:
         return None
+    
 
-
-def labelTweets(engine, vectorizer, classifier, tweets, threshold):
-    """label new tweets with a combination of self-training and manual annotation and save them to the database
+def labelSelfTrain(engine, vectorizer, classifier, tweets, threshold):
+    """label a data set of new tweets via self-training and save them to the database
     :param engine: sqlalchemy engine for database connection
     :param vectorizer: sklearn text vectorizer used for feature creation
     :param classifier: sklearn classifier used for classification/prediction
     :param tweets: a dataframe of tweets to be labeled [title, tweet_id, tweet_text]
     :param threshold: predicted probability threshold to be used for self-training
-    :return: dataframe of newly labeled tweets (labeled tweets also written to the database)
+    :return: a dataframe of newly labeled tweets or None on failure
+    note: tweets with max class probabilities above the threshold will be auto-labeled
+    """
+    
+    classprobs = classifier.predict_proba(vectorizer.transform(tweets.tweet_text))
+    labeled = tweets.copy()
+    
+    labeled['pr_neg'] = classprobs[:, 0]
+    labeled['pr_neu'] = classprobs[:, 1]
+    labeled['pr_pos'] = classprobs[:, 2]
+    
+    labeled = labeled.ix[np.amax(labeled[['pr_neg', 'pr_neu', 'pr_pos']], axis=1) >= threshold, :]
+    labeled['label']  = np.argmax(np.array(labeled[['pr_neg', 'pr_neu', 'pr_pos']]), axis=1) - 1
+    labeled['method'] = 'self-training'
+    
+    neg = labeled.ix[labeled.label == -1, :].shape[0]
+    neu = labeled.ix[labeled.label ==  0, :].shape[0]
+    pos = labeled.ix[labeled.label ==  1, :].shape[0]
+
+    print("{0} Negative, {1} Neutral, and {2} Positive Tweets Labeled via Self-Training".format(neg, neu, pos))
+    labeled.to_sql('labeled', engine, if_exists='append', index=False)
+
+    if not labeled.empty:
+        return labeled
+    else:
+        return None
+
+
+def labelManual(engine, vectorizer, classifier, tweets, threshold):
+    """label a data set of new tweets via manual annotation and save them to the database
+    :param engine: sqlalchemy engine for database connection
+    :param vectorizer: sklearn text vectorizer used for feature creation
+    :param classifier: sklearn classifier used for classification/prediction
+    :param tweets: a dataframe of tweets to be labeled [title, tweet_id, tweet_text]
+    :param threshold: predicted probability threshold to be used for manual annotation
+    :return: a dataframe of the newly labeled tweets or None on failure
+    note: only tweets with max class probabilities below the threshold will be manually labeled
     """
 
     classprobs = classifier.predict_proba(vectorizer.transform(tweets.tweet_text))
-    tweets['pr_neg'] = classprobs[:, 0]
-    tweets['pr_neu'] = classprobs[:, 1]
-    tweets['pr_pos'] = classprobs[:, 2]
+    labeled = tweets.copy()
 
-    selftrain = tweets.ix[np.amax(tweets[['pr_neg', 'pr_neu', 'pr_pos']], axis=1) >= threshold, :].copy()
-    selftrain.reset_index(inplace=True, drop=True)
-    selftrain['label']  = np.argmax(np.array(selftrain[['pr_neg', 'pr_neu', 'pr_pos']]), axis=1) - 1
-    selftrain['method'] = 'self-training'
+    labeled['pr_neg'] = classprobs[:, 0]
+    labeled['pr_neu'] = classprobs[:, 1]
+    labeled['pr_pos'] = classprobs[:, 2]
 
-    manual = tweets.ix[np.amax(tweets[['pr_neg', 'pr_neu', 'pr_pos']], axis=1) < threshold, :].copy()
-    manual.reset_index(inplace=True, drop=True)
-    manual['label']  = np.nan
-    manual['method'] = 'manual-annotation'
+    labeled = labeled.ix[np.amax(labeled[['pr_neg', 'pr_neu', 'pr_pos']], axis=1) < threshold, :]
+    labeled.reset_index(inplace=True, drop=True)
+    labeled['label']  = np.nan
+    labeled['method'] = 'manual-annotation'
 
     i = 0
     while True:
         try:
 
-            print("\nTweet #{0}: {1}".format(i, manual.tweet_text[i]))
-            print("Predicted Probabilities: neg={0:4.3f} neu={1:4.3f} pos={2:4.3f}".format(manual.pr_neg[i], manual.pr_neu[i], manual.pr_pos[i]))
+            print("\nTweet #{0}: {1}".format(i, labeled.tweet_text[i]))
+            print("Predicted Probabilities: neg={0:4.3f} neu={1:4.3f} pos={2:4.3f}".format(labeled.pr_neg[i], labeled.pr_neu[i], labeled.pr_pos[i]))
             selection = input("Choose an Option: [-1]=Negative | [0]=Neutral | [1]=Positive | [s]=Skip | [q]=Quit\n")
 
             if selection.strip().lower() not in ['-1', '0', '1', 's', 'q']:
@@ -227,7 +261,7 @@ def labelTweets(engine, vectorizer, classifier, tweets, threshold):
                 continue
             elif selection.strip().lower() in ['-1', '0', '1']:
                 print("Tweet manually labeled")
-                manual.ix[i, 'label'] = int(selection.strip().lower())
+                labeled.ix[i, 'label'] = int(selection.strip().lower())
             elif selection.strip().lower() == 's':
                 print("Tweet skipped")
                 pass
@@ -237,26 +271,19 @@ def labelTweets(engine, vectorizer, classifier, tweets, threshold):
             i += 1
 
         except KeyError:
-            print("\nThere are no more tweets to manually label")
+            print("\nThere are no more tweets to labeledly label")
             break
-    manual = manual.ix[manual.label.notnull(), :]
 
-    neg = selftrain.ix[selftrain.label == -1, :].shape[0]
-    neu = selftrain.ix[selftrain.label ==  0, :].shape[0]
-    pos = selftrain.ix[selftrain.label ==  1, :].shape[0]
-    print("{0} Negative, {1} Neutral, and {2} Positive Tweets Labeled via Self-Training".format(neg, neu, pos))
+    neg = labeled.ix[labeled.label == -1, :].shape[0]
+    neu = labeled.ix[labeled.label ==  0, :].shape[0]
+    pos = labeled.ix[labeled.label ==  1, :].shape[0]
 
-    neg = manual.ix[manual.label == -1, :].shape[0]
-    neu = manual.ix[manual.label ==  0, :].shape[0]
-    pos = manual.ix[manual.label ==  1, :].shape[0]
     print("{0} Negative, {1} Neutral, and {2} Positive Tweets Labeled via Manual Annotation".format(neg, neu, pos))
+    labeled = labeled.ix[labeled.label.notnull(), :]
+    labeled.to_sql('labeled', engine, if_exists='append', index=False)
 
-    labels = pd.concat([selftrain, manual], axis=0, ignore_index=True)
-    labels.to_sql('labeled', engine, if_exists='append', index=False)
-
-    print("{0} Total Labeled Tweets Added to the Database".format(labels.shape[0]))
-    if not labels.empty:
-        return labels
+    if not labeled.empty:
+        return labeled
     else:
         return None
 
@@ -264,7 +291,7 @@ def labelTweets(engine, vectorizer, classifier, tweets, threshold):
 # run some unit tests with the functions defined above
 #-----------------------------------------------------
 
-# load in the raw VADER tweet data and separate into [init, batch, test] data
+# load in the raw training data and separate into [init, batch, test] data
 
 X, y = loadRawData(RAWDATA, 'text', 'sentiment', sep='\t')
 accuracies = []
@@ -275,11 +302,12 @@ X_batch_2, y_batch_2 = X[2000:2500], y[2000:2500]
 X_batch_3, y_batch_3 = X[2500:3000], y[2500:3000]
 X_test,    y_test    = X[3000:],     y[3000:]
 
+saveRawData(ENGINE, X_init, y_init)
 cnx = sqlite3.connect('data/database.db')
 cur = cnx.cursor()
 cur.execute('DELETE FROM labeled')
-saveRawData(X_init, y_init)
 cnx.commit()
+cnx.close()
 
 batch_1 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_1)) + 1000,   'tweet_text': X_batch_1})
 batch_2 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_2)) + 10000,  'tweet_text': X_batch_2})
@@ -288,21 +316,23 @@ batch_3 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_3)) +
 # iteratively re-train and assess test set accuracy
 
 # initial training/scoring
-vectorizer, classifier = initTrain(X_init, y_init)
+vectorizer, classifier = cvTrain(X_init, y_init)
 accuracies.append(classifier.score(vectorizer.transform(X_test), y_test))
 
 # re-fit after handling batch #1
-labeled = labelTweets(ENGINE, vectorizer, classifier, batch_1, THRESHOLD)
+labelSelfTrain(ENGINE, vectorizer, classifier, batch_1, THRESHOLD)
+# labelManual(ENGINE, vectorizer, classifier, batch_1, THRESHOLD)
 vectorizer, classifier = reTrain(ENGINE, vectorizer, classifier)
 accuracies.append(classifier.score(vectorizer.transform(X_test), y_test))
 
 # re-fit after handling batch #2
-labeled = labelTweets(ENGINE, vectorizer, classifier, batch_2, THRESHOLD)
+labelSelfTrain(ENGINE, vectorizer, classifier, batch_2, THRESHOLD)
+# labelManual(ENGINE, vectorizer, classifier, batch_2, THRESHOLD)
 vectorizer, classifier = reTrain(ENGINE, vectorizer, classifier)
 accuracies.append(classifier.score(vectorizer.transform(X_test), y_test))
 
 # re-fit after handling batch #3
-labeled = labelTweets(ENGINE, vectorizer, classifier, batch_3, THRESHOLD)
+labelSelfTrain(ENGINE, vectorizer, classifier, batch_3, THRESHOLD)
+# labelManual(ENGINE, vectorizer, classifier, batch_3, THRESHOLD)
 vectorizer, classifier = reTrain(ENGINE, vectorizer, classifier)
 accuracies.append(classifier.score(vectorizer.transform(X_test), y_test))
-

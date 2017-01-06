@@ -13,13 +13,13 @@ from bs4 import BeautifulSoup
 #----------------------------------
 
 CREDENTIALS   = json.loads(open("auth/twitter.json", "r").read())
-BO_ENDPOINT_1 = "http://www.boxofficemojo.com/daily/"
-BO_ENDPOINT_2 = "http://www.boxofficemojo.com/daily/chart/?view=1day&sortdate={0}&p=.htm"
+BO_ENDPOINT   = "http://www.boxofficemojo.com/daily/chart/?view=1day&sortdate={0}&p=.htm"
 OMDB_ENDPOINT = "http://www.omdbapi.com/"
 DB_FILE       = "data/database.db"
 ENGINE        = create_engine("sqlite:///{0}".format(DB_FILE))
-MAX_TWEETS    = 200  # max number of tweets to gather for each movie title
-CNT_MOVIES    = 12   # number of movies (by descending revenue) to take from daily box office
+FIRSTDATE     = '2017-01-01' # first date of data collection
+MAX_TWEETS    = 200          # max number of tweets to gather for each movie title
+CNT_MOVIES    = 12           # number of movies (by descending revenue) to take from daily box office
 
 # define some general utility functions
 #--------------------------------------
@@ -31,35 +31,44 @@ def processTitle(title):
     note: removes parenthetical year and after-colon text from the titles
     """
 
-    cleaned = re.sub(r'[!@#$%?]+', '', title.lower().strip())
+    cleaned = re.sub(r'[@#]+', '', title.lower().strip())
     cleaned = re.sub(r'\(\d{4}.*\)', '', cleaned)
     cleaned = re.sub(r':.+', '', cleaned).strip()
     return cleaned
 
 
+def outputData(tname):
+    """output a data table to CSV for visual inspection
+    :param tname: string name of the table to output
+    :return: None
+    """
+
+    table = pd.read_sql("SELECT * FROM {0}".format(tname), ENGINE)
+    table.to_csv("data/{0}.csv".format(tname), sep=",", header=True, index=False, quoting=csv.QUOTE_NONNUMERIC)
+
+
 # define functions to scrape data from BoxOfficeMojo
 #---------------------------------------------------
 
-def findLastDate(endpoint):
-    """find the date of the most recent BoxOfficeMojo daily numbers
-    :param endpoint: URL of the BOMojo daily listings
-    :return: string date in YYYY-MM-DD format
-    note: current endpoint: http://www.boxofficemojo.com/daily/
+def findNextDate(cnx, firstdate):
+    """pull the next date for which to search for new data
+    :param cnx: database connection
+    :param firstdate: first date for which to search for data [YYYY-MM-DD]
+    :return: date for which to search for new data [YYYY-MM-DD]
     """
 
+    cur = cnx.cursor()
+    cur.execute("SELECT gross_date FROM boxoffice ORDER BY gross_date DESC LIMIT 1")
+
     try:
-        response = urlreq.urlopen(endpoint)
-        soup     = BeautifulSoup(response.read(), "html.parser")
-        links    = soup.find_all('a', href=re.compile(r"/daily/chart/\?sortdate=\d{4}-\d{2}-\d{2}&p=\.htm"))
-        lastdate = re.match(r".+(\d{4}-\d{2}-\d{2}).+", links[-1]['href']).group(1)
-        return lastdate
-    except urlerr.URLError as err:
-        print("\nThere was an error retrieving the daily BOMojo chart")
-        print(err)
-        return None
-    except Exception:
-        print("\nThere's something wrong with the BOMojo Chart")
-        return None
+        lastdate = cur.fetchone()[0]
+        nextdate = datetime.strptime(lastdate, '%Y-%m-%d') + timedelta(days=1)
+        nextdate = nextdate.strftime('%Y-%m-%d')
+    except TypeError:
+        nextdate = firstdate
+    finally:
+        cur.close()
+    return nextdate
 
 
 def getTopMovies(endpoint, date, count=10):
@@ -69,7 +78,7 @@ def getTopMovies(endpoint, date, count=10):
     :param count: number of movies (descending by revenue) to pull
     :return: dataframe of movie information
     note: the endpoint should have a str.format() placeholder for the date, e.g.
-    current endpoint: http://www.boxofficemojo.com/daily/chart/?view=1day&sortdate={0}&p=.htm
+    note: current endpoint: http://www.boxofficemojo.com/daily/chart/?view=1day&sortdate={0}&p=.htm
     """
 
     try:
@@ -79,7 +88,6 @@ def getTopMovies(endpoint, date, count=10):
         tdata    = []
 
         for i, row in enumerate(table.find_all('tr')[1:], start=1):
-
             if i > count:
                 break
 
@@ -106,21 +114,6 @@ def getTopMovies(endpoint, date, count=10):
     except Exception:
         print("\nThere's something wrong with the BOMojo daily revenue page")
         return None
-
-
-def getNewMovies(cnx, titles):
-    """find the new box office titles not already in the movies table
-    :param cnx: database connection
-    :param titles: movie titles from the daily box office data
-    :return: set of new movie titles
-    """
-
-    cur = cnx.cursor()
-    cur.execute("SELECT DISTINCT title FROM movies")
-    existing  = [title[0] for title in cur.fetchall()]
-    newmovies = set(titles) - set(existing)
-    return newmovies
-
 
 # define functions to pull data from the Twitter API
 #---------------------------------------------------
@@ -198,7 +191,7 @@ def searchMovie(api, title, date, count, retweets=False):
     :param retweets: whether or not to include retweets when searching
     :return: dataframe of processed tweets
     note: for the time being tweets with links are excluded from the search - these are often from
-    organizational accounts and/or for marketing purposes and don't reflect individual sentiment
+    note: organizational accounts and/or for marketing purposes and don't reflect individual sentiment
     """
 
     since = date
@@ -264,15 +257,15 @@ def getMovieInfo(endpoint, title, year):
     except requests.exceptions.Timeout:
         print("The HTTP request timed out")
     except LookupError:
-        print("Movie not found via OMDB")
+        print("Movie [{0}] - [{1}] not found via OMDB".format(title, year))
     return None
 
 
-def insertMovie(cnx, title, year, results):
+def insertMovie(cnx, title, date, results):
     """insert a new movie into the movies table
     :param cnx: database connection
     :param title: movie title
-    :param year: movie release year
+    :param date: search date
     :param results: getMovieInfo() results
     :return: None
     """
@@ -280,7 +273,7 @@ def insertMovie(cnx, title, year, results):
     try:
         cur = cnx.cursor()
         cur.execute('INSERT INTO movies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                    (title, year, results['Actors'], results['Director'], results['Genre'], results['Plot'],
+                    (title, date, results['Actors'], results['Director'], results['Genre'], results['Plot'],
                      results['Rated'], results['Released'], results['Runtime'], results['Metascore'], results['imdbID'],
                      results['imdbRating'], results['imdbVotes'], results['tomatoConsensus'], results['tomatoMeter'],
                      results['tomatoReviews']))
@@ -288,8 +281,7 @@ def insertMovie(cnx, title, year, results):
     except sqlite3.Error:
         print('There was an error inserting movie into the database')
     finally:
-        cnx.commit()
-        if cur: cur.close()
+        cur.close()
 
 
 # define a driver function to gather new daily data
@@ -303,38 +295,29 @@ def gatherData():
     note: should only be run once a day or primary key constraints will fail
     """
 
-    # connect to database and set up tweepy API
+    # connect to database, set up the tweepy API object, and find the next date to search
 
     cnx = sqlite3.connect(DB_FILE)
     api = generateAPI(wait_on_rate_limit=True, wait_on_rate_limit_notify=True, **CREDENTIALS)
 
-    # find the most recent box office data already stored
+    nextdate = findNextDate(cnx, FIRSTDATE)
+    year = nextdate[:4]
 
-    cur = cnx.cursor()
-    cur.execute("SELECT gross_date FROM boxoffice ORDER BY gross_date DESC LIMIT 1")
+    # attempt to scrape box office data
 
-    lastdate = cur.fetchall()[0][0]
-    curdate  = findLastDate(BO_ENDPOINT_1)
-
-    if curdate == lastdate:
-        print("No New Box Office Data Available: {0}".format(curdate))
-        raise Exception
-
-    # scrape box office data
-
-    bodata = getTopMovies(BO_ENDPOINT_2, curdate, CNT_MOVIES)
+    bodata = getTopMovies(BO_ENDPOINT, nextdate, CNT_MOVIES)
 
     if not bodata.empty:
         bodata.to_sql('boxoffice', ENGINE, if_exists='append', index=False)
-        print("Box Office Data for {0} Written to Database".format(curdate))
+        print("Box Office Data for [{0}] Written to Database".format(nextdate))
     else:
-        print("Error Scraping/Writing Box Office Data for [{0}]".format(curdate))
+        print("Error Scraping/Writing Box Office Data for [{0}]".format(nextdate))
         raise Exception
 
-    # get tweet data
+    # attempt to collect tweet data
 
     for movie in bodata.title:
-        tweets = searchMovie(api, movie, curdate, MAX_TWEETS)
+        tweets = searchMovie(api, movie, nextdate, MAX_TWEETS)
         if not tweets.empty:
             tweets.to_sql('tweets', ENGINE, if_exists='append', index=False)
             print("Tweets for [{0}] Written to Database".format(movie))
@@ -342,17 +325,18 @@ def gatherData():
             print("Error Fetching/Writing Tweets for [{0}]".format(movie))
             raise Exception
 
-    # get new movie info
+    # attempt to collect movie metadata
 
-    newmovies = getNewMovies(cnx, bodata.title)
-    year      = curdate[:4]
-
-    for movie in newmovies:
+    for movie in bodata.title:
         minfo = getMovieInfo(OMDB_ENDPOINT, processTitle(movie), year)
         if minfo:
-            insertMovie(cnx, movie, year, minfo)
+            insertMovie(cnx, movie, nextdate, minfo)
         else:
-            print("Movie: [{0}] Not Found via OMDB".format(movie))
+            minfo = getMovieInfo(OMDB_ENDPOINT, processTitle(movie), str(int(year)-1))
+            if minfo:
+                insertMovie(cnx, movie, nextdate, minfo)
+            else:
+                print("Movie: [{0}] Could Not be Found via OMDB".format(movie))
 
     # commit changes and close DB connection
 
@@ -360,27 +344,14 @@ def gatherData():
     cnx.close()
 
 
-def outputData(tname):
-    """output a data table to CSV for visual inspection
-    :param tname: string name of the table to output
-    """
-
-    table = pd.read_sql("SELECT * FROM {0}".format(tname), ENGINE)
-    table.to_csv("data/{0}.csv".format(tname), sep=",", header=True, index=False, quoting=csv.QUOTE_NONNUMERIC)
-
 # execute the main data gathering and output functions
 #-----------------------------------------------------
 
 if __name__ == "__main__":
     gatherData()
-
-# output data tables to CSV
-#--------------------------
-
-# outputData("movies")
-# outputData("boxoffice")
-# outputData("tweets")
-# outputData("labeled")
+    outputData("boxoffice")
+    outputData("tweets")
+    outputData("movies")
 
 # check resource usage status and rate limit period
 #--------------------------------------------------

@@ -26,7 +26,7 @@ boxoffice = '''CREATE TABLE boxoffice (
 
 movies = '''CREATE TABLE movies (
               title           TEXT,
-              year            TEXT,
+              search_date     TEXT,
               actors          TEXT,
               director        TEXT,
               genres          TEXT,
@@ -41,7 +41,7 @@ movies = '''CREATE TABLE movies (
               tomatoconsensus TEXT,
               tomatometer     INTEGER,
               tomatoreviews   INTEGER,
-              PRIMARY KEY (title)
+              PRIMARY KEY (title, search_date)
             )'''
 
 tweets = '''CREATE TABLE tweets (

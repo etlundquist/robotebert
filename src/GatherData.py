@@ -21,7 +21,7 @@ DB_FILE       = "data/database.db"
 ENGINE        = create_engine("sqlite:///{0}".format(DB_FILE))
 FIRSTDATE     = '2017-01-01' # first date of data collection
 MAX_TWEETS    = 200          # max number of tweets to gather for each movie title
-CNT_MOVIES    = 12           # number of movies (by descending revenue) to take from daily box office
+CNT_MOVIES    = 10           # number of movies (by descending revenue) to take from daily box office
 
 # define some general utility functions
 #--------------------------------------
@@ -33,7 +33,7 @@ def processTitle(title):
     note: removes parenthetical year and after-colon text from the titles
     """
 
-    cleaned = re.sub(r'[@#]+', '', title.lower().strip())
+    cleaned = re.sub(r'[@#\"]+', '', title.lower().strip())
     cleaned = re.sub(r'\(\d{4}.*\)', '', cleaned)
     cleaned = re.sub(r':.+', '', cleaned).strip()
     return cleaned
@@ -86,7 +86,7 @@ def getTopMovies(endpoint, date, count=10):
     try:
         response = urlreq.urlopen(endpoint.format(date))
         soup     = BeautifulSoup(response.read(), "html.parser")
-        table    = soup.find_all('table')[8]
+        table    = soup.find('table', border="0", cellpadding="5", cellspacing="1")
         tdata    = []
 
         for i, row in enumerate(table.find_all('tr')[1:], start=1):
@@ -259,7 +259,7 @@ def getMovieInfo(endpoint, title, year):
     except requests.exceptions.Timeout:
         print("The HTTP request timed out")
     except LookupError:
-        print("Could not find the movie/year combination: {0} - {1}".format(title, year))
+        pass
     return None
 
 
@@ -291,6 +291,7 @@ def insertMovie(cnx, title, date, results):
 
 def gatherData():
     """main driver program to gather daily data
+    :return: date for which data has been gathered
     1. daily box office data from BoxOfficeMojo
     2. daily tweets for each title taken from the daily box office charts
     3. detailed movie metadata from OMDB for any new movie appearing on the daily charts
@@ -318,11 +319,14 @@ def gatherData():
     # attempt to collect tweet data
 
     for movie in bodata.title:
-        tweets = searchMovie(api, movie, nextdate, MAX_TWEETS)
-        if not tweets.empty:
-            tweets.to_sql('tweets', ENGINE, if_exists='append', index=False)
-            print("Tweets for [{0}] Written to Database".format(movie))
-        else:
+        try:
+            tweets = searchMovie(api, movie, nextdate, MAX_TWEETS)
+            if not tweets.empty:
+                tweets.to_sql('tweets', ENGINE, if_exists='append', index=False)
+                print("Tweets for [{0}] Written to Database".format(movie))
+            else:
+                raise TweetError("Error Fetching/Writing Tweets for [{0}]".format(movie))
+        except tweepy.error.TweepError:
             raise TweetError("Error Fetching/Writing Tweets for [{0}]".format(movie))
 
     # attempt to collect movie metadata
@@ -340,19 +344,16 @@ def gatherData():
 
     # commit changes and close DB connection
 
-    print("\nAll Data for {0} Successfully Added to the Database!\n".format(nextdate))
     cnx.commit()
     cnx.close()
+
+    print("\nAll Data for {0} Successfully Added to the Database!\n".format(nextdate))
+    return nextdate
 
 
 # execute the main data gathering function and output updated tables to CSV
 #--------------------------------------------------------------------------
 
 if __name__ == "__main__":
-
     gatherData()
-    outputData("boxoffice")
-    outputData("tweets")
-    outputData("movies")
-
 

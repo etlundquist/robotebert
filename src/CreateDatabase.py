@@ -64,6 +64,14 @@ tweets = '''CREATE TABLE tweets (
               PRIMARY KEY (title, tweet_id)
             )'''
 
+validation = '''CREATE TABLE validation (
+                  title      TEXT,
+                  tweet_id   INTEGER,
+                  tweet_text TEXT,
+                  label      INTEGER,
+                  PRIMARY KEY (title, tweet_id)
+                )'''
+
 labeled = '''CREATE TABLE labeled (
                title      TEXT,
                tweet_id   INTEGER,
@@ -76,10 +84,24 @@ labeled = '''CREATE TABLE labeled (
                PRIMARY KEY (title, tweet_id)
             )'''
 
+metrics = '''CREATE TABLE metrics (
+               title      TEXT,
+               pred_date  TEXT,
+               pr_cls_neg REAL,
+               pr_cls_neu REAL,
+               pr_cls_pos REAL,
+               avg_pr_neg REAL,
+               avg_pr_neu REAL,
+               avg_pr_pos REAL,
+               PRIMARY KEY (title, pred_date)
+            )'''
+
 cur.execute(boxoffice)
 cur.execute(movies)
 cur.execute(tweets)
+cur.execute(validation)
 cur.execute(labeled)
+cur.execute(metrics)
 
 # commit changes and close the connection
 #----------------------------------------

@@ -1,7 +1,7 @@
 # import required modules
 #------------------------
 
-import re, string, sqlite3
+import os, re, string, pickle
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine
@@ -23,8 +23,7 @@ from sklearn.linear_model import LogisticRegression
 DB_FILE   = "data/database.db"
 ENGINE    = create_engine("sqlite:///{0}".format(DB_FILE))
 RAWDATA   = 'data/vader-tweets-data.tsv'
-DATE      = '2017-01-03'
-THRESHOLD = 0.90
+FIRSTDATE = '2017-01-01'
 
 # define functions to save and load the raw training data from disk
 #------------------------------------------------------------------
@@ -138,7 +137,7 @@ def cvTrain(X, y):
     classifier = LogisticRegression(penalty='l2', multi_class='multinomial', solver='sag', max_iter=250)
     pipeline   = Pipeline([('vct', vectorizer), ('clf', classifier)])
     parameters = dict(vct__ngram_range=[(1,1), (1,2)], vct__max_features=[5000, 10000, 20000],
-                      vct__binary=[True, False], clf__C=[1e-1, 1, 10, 100])
+                      vct__binary=[True, False], clf__C=[0.1, 1, 10])
 
     # use cross-validation to select tuning parameters
     print("Tuning the Model on Initial Data via Cross Validation")
@@ -155,11 +154,10 @@ def cvTrain(X, y):
     return cv.best_estimator_
 
 
-def reTrain(engine, estimator, epochs=20):
+def reTrain(engine, estimator):
     """fully re-train the estimator using both the original training and newly labeled data
     :param engine: sqlalchemy engine for database connection
     :param estimator: sklearn pipeline estimator
-    :param epochs: number of training epochs (full passes through the training data)
     :return: the re-fit [estimator] object
     """
 
@@ -173,7 +171,8 @@ def reTrain(engine, estimator, epochs=20):
     y = np.array(o_y.append(n_y))
 
     estimator.set_params(clf__verbose=1)
-    return estimator.fit(X, y)
+    estimator = estimator.fit(X, y)
+    return estimator
 
 
 # define functions to pull unlabeled tweets from the database and label them
@@ -196,6 +195,7 @@ def pullTweets(engine, date, count=25):
                    WHERE  tweet_date = "{0}"
                    AND    title = "{1}"
                    AND    tweet_id NOT IN (SELECT DISTINCT tweet_id FROM labeled)
+                   AND    tweet_id NOT IN (SELECT DISTINCT tweet_id FROM validation)
                    LIMIT  {2}'''.format(date, title, count)
         tweets.append(pd.read_sql(query, engine))
 
@@ -302,62 +302,94 @@ def labelManual(engine, estimator, tweets, threshold):
         return None
 
 
+# define functions to initialize/train the model and set up the validation data
+# -----------------------------------------------------------------------------
+
+def initModel(engine, X, y, fname='SentimentModel.p'):
+    """initialize the SentimentModel using a given training set
+    :param engine: sqlalchemy engine for database connection
+    :param X: tweet text vector
+    :param y: sentiment label vector
+    :param fname: filename for the model object
+    :return: the fit [estimator] object
+    note: the fit estimator object is also saved to disk for re-use
+    """
+
+    estimator = cvTrain(X, y)
+    saveRawData(engine, X, y)
+
+    print("Saving Fit Estimator to Disk")
+    mfile = open(os.path.join('models', fname), 'wb')
+    pickle.dump(estimator, mfile)
+    return estimator
+
+
+def initUpdateValidation(engine, date, count=20, method='update'):
+    """initialize [init] or update [update] the validation set via manual labeling of tweets
+    :param engine: sqlalchemy engine for database connection
+    :param date: date from which to pull tweets
+    :param count: number of tweets pulled per title
+    :param method: whether to initialize/replace [init] or update [update] the validation set
+    :return: None
+    """
+
+    if method not in ['init', 'update']:
+        raise TypeError('please choose either [init] or [update]')
+
+    action = 'replace' if method == 'init' else 'append'
+    tweets = pullTweets(engine, date, count)
+    tweets['label'] = np.nan
+
+    i = 0
+    while True:
+        try:
+
+            print("\nTweet #{0}: {1}".format(i, tweets.tweet_text[i]))
+            selection = input("Choose an Option: [-1]=Negative | [0]=Neutral | [1]=Positive | [s]=Skip | [q]=Quit\n")
+
+            if selection.strip().lower() not in ['-1', '0', '1', 's', 'q']:
+                print("Please choose a valid selection")
+                continue
+            elif selection.strip().lower() in ['-1', '0', '1']:
+                print("Tweet manually labeled")
+                tweets.ix[i, 'label'] = int(selection.strip().lower())
+            elif selection.strip().lower() == 's':
+                print("Tweet skipped")
+                pass
+            else:
+                print("\nLabeling terminated by user")
+                break
+            i += 1
+
+        except KeyError:
+            print("\nThere are no more tweets to labeledly label")
+            break
+
+    neg = tweets.ix[tweets.label == -1, :].shape[0]
+    neu = tweets.ix[tweets.label ==  0, :].shape[0]
+    pos = tweets.ix[tweets.label ==  1, :].shape[0]
+
+    print("{0} Negative, {1} Neutral, and {2} Positive Tweets Added to the Validation Set".format(neg, neu, pos))
+    tweets = tweets.ix[tweets.label.notnull(), :]
+    tweets.to_sql('validation', engine, if_exists=action, index=False)
+
+
 # run some unit tests with the functions defined above
 #-----------------------------------------------------
 
 if __name__ == "__main__":
 
-    # STEPS TO DO LATER
-    # 1. CV train the model on the VADER tweets data
-    # 2. Manually label a lot of downloaded tweets (100 per film, a few distinct days)
-    # 3. replace the original training data with this new domain-specific training set
-    # 4. CV re-train the model with the new labeled data set
-    # 5. truncate the labeled table (it will be filled with interative labels)
-    # 6. pickle the model to avoid having to fully retrain
-    # 7. write a driver program to look for new data and re-train the model
-
-    # load in the raw training data and separate into [init, batch, test] data
-
+    # load the raw VADER tweet data, remove links, and save it to the database
     X, y = loadRawData(RAWDATA, 'text', 'sentiment', sep='\t')
-    accuracies = []
+    X = [re.sub(r'https?://[\w.-]+', '', tweet) for tweet in X]
+    saveRawData(ENGINE, X, y)
 
-    X_init,    y_init    = X[:1500],     y[:1500]
-    X_batch_1, y_batch_1 = X[1500:2000], y[1500:2000]
-    X_batch_2, y_batch_2 = X[2000:2500], y[2000:2500]
-    X_batch_3, y_batch_3 = X[2500:3000], y[2500:3000]
-    X_test,    y_test    = X[3000:],     y[3000:]
+    # create a small validation set to check model performance
+    initUpdateValidation(ENGINE, FIRSTDATE, count=20, method='init')
 
-    saveRawData(ENGINE, X_init, y_init)
-    cnx = sqlite3.connect('data/database.db')
-    cur = cnx.cursor()
-    cur.execute('DELETE FROM labeled')
-    cnx.commit()
-    cnx.close()
+    # initialize the model and score the validation set
+    estimator  = initModel(ENGINE, X, y)
+    validation = pd.read_sql('validation', ENGINE)
+    score      = estimator.score(validation.tweet_text, validation.label)
+    print("Initial Validation Accuracy: {0:4.3f} ({1} Validation Samples)".format(score, validation.shape[0]))
 
-    batch_1 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_1)) + 1000,   'tweet_text': X_batch_1})
-    batch_2 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_2)) + 10000,  'tweet_text': X_batch_2})
-    batch_3 = pd.DataFrame({'title': 'test', 'tweet_id': np.arange(len(X_batch_3)) + 100000, 'tweet_text': X_batch_3})
-
-    # iteratively re-train and assess test set accuracy
-
-    # initial training/scoring
-    estimator = cvTrain(X_init, y_init)
-    accuracies.append(estimator.score(X_test, y_test))
-
-    # re-fit after handling batch #1
-    labelSelfTrain(ENGINE, estimator, batch_1, THRESHOLD)
-    labelManual(ENGINE, estimator, batch_1, THRESHOLD)
-    estimator = reTrain(ENGINE, estimator)
-    accuracies.append(estimator.score(X_test, y_test))
-
-    # re-fit after handling batch #2
-    labelSelfTrain(ENGINE, estimator, batch_2, THRESHOLD)
-    labelManual(ENGINE, estimator, batch_2, THRESHOLD)
-    estimator = reTrain(ENGINE, estimator)
-    accuracies.append(estimator.score(X_test, y_test))
-
-    # re-fit after handling batch #3
-    labelSelfTrain(ENGINE, estimator, batch_3, THRESHOLD)
-    labelManual(ENGINE, estimator, batch_3, THRESHOLD)
-    estimator = reTrain(ENGINE, estimator)
-    accuracies.append(estimator.score(X_test, y_test))
